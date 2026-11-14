@@ -1,0 +1,210 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  ANDROID_API: "33"
+  ANDROID_BUILD_TOOLS: "33.0.2"
+  ANDROID_NDK_VERSION: "25.1.8937393"
+  CMDLINE_TOOLS_ZIP: "commandlinetools-linux-11076708_latest.zip"
+  BUILDOZER_WARN_ON_ROOT: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install system packages and compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gfortran autoconf automake libtool libtool-bin autopoint gettext \
+            libblas-dev liblapack-dev cython3 \
+            git zip unzip curl file pkg-config cmake ccache \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev \
+            libsqlite3-dev libbz2-dev libreadline-dev liblzma-dev uuid-dev \
+            libdb-dev libgdbm-dev tk-dev
+
+      - name: Install Android SDK, build-tools and NDK
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/${CMDLINE_TOOLS_ZIP}"
+          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv /tmp/cmdtools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          mkdir -p "$ANDROID_HOME/tools/bin"
+          printf '#!/bin/sh\nexec "%s/cmdline-tools/latest/bin/sdkmanager" "$@"\n' "$ANDROID_HOME" > "$ANDROID_HOME/tools/bin/sdkmanager"
+          chmod +x "$ANDROID_HOME/tools/bin/sdkmanager"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          set +o pipefail
+          yes | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+          set -o pipefail
+          "$SDKM" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          test -x "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/aapt2"
+          test -d "$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Make /usr/local writable
+        run: |
+          sudo mkdir -p /usr/local/bin /usr/local/lib /usr/local/include /usr/local/share
+          sudo chown -R "$(id -u):$(id -g)" /usr/local/bin /usr/local/lib /usr/local/include /usr/local/share
+          sudo chmod -R a+rwX /usr/local/bin /usr/local/lib /usr/local/include /usr/local/share
+
+      - name: Install Buildozer and Cython
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "buildozer==1.5.0" "cython==0.29.36" "setuptools<70" virtualenv
+          which python cython buildozer
+          cython --version
+
+      - name: Locate the project and verify core files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "Repository root: $GITHUB_WORKSPACE"
+          find_file() {
+            find . -maxdepth 5 -type f -iname "$1" \
+              -not -path "./.git/*" -not -path "*/.buildozer/*" -not -path "*/node_modules/*" -not -path "*/bin/*" \
+              | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n 1 | cut -d' ' -f2-
+          }
+          SPEC="$(find_file 'buildozer.spec')"
+          if [ -z "$SPEC" ]; then SPEC="$(find_file 'buildozer.spec.*')"; fi
+          if [ -z "$SPEC" ]; then
+            echo "::error::buildozer.spec was not found anywhere in this repository."
+            exit 1
+          fi
+          echo "Found spec file: $SPEC"
+          SPEC_DIR="$(cd "$(dirname "$SPEC")" && pwd)"
+          if [ "$(basename "$SPEC")" != "buildozer.spec" ]; then
+            cp -v "$SPEC" "$SPEC_DIR/buildozer.spec"
+          fi
+          sed -i 's/\r$//' "$SPEC_DIR/buildozer.spec"
+          APP_DIR="$SPEC_DIR"
+
+          if [ -f "$APP_DIR/main.py" ]; then
+            SRC_DIR="$APP_DIR"
+          else
+            MAIN="$(find_file 'main.py')"
+            if [ -z "$MAIN" ]; then
+              echo "::error::main.py was not found in the repository."
+              exit 1
+            fi
+            SRC_DIR="$(cd "$(dirname "$MAIN")" && pwd)"
+            REL="$(realpath --relative-to="$APP_DIR" "$SRC_DIR")"
+            if grep -qE '^source\.dir[[:space:]]*=' "$APP_DIR/buildozer.spec"; then
+              sed -i -E "s|^source\.dir[[:space:]]*=.*|source.dir = ${REL}|" "$APP_DIR/buildozer.spec"
+            else
+              sed -i "/^\[app\]/a source.dir = ${REL}" "$APP_DIR/buildozer.spec"
+            fi
+          fi
+
+          # नई और सही फाइलों (main.py, agents.py, broker.py) की जाँच
+          MISSING=0
+          for f in main.py agents.py broker.py; do
+            if [ ! -f "$SRC_DIR/$f" ]; then
+              echo "::error::$f is missing next to main.py ($SRC_DIR). The app cannot start without it."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Files next to main.py:"; ls -la "$SRC_DIR"
+            exit 1
+          fi
+
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Build folder: $APP_DIR"
+          ls -la "$APP_DIR"
+
+      - name: Point buildozer.spec at the SDK and NDK
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          test -f buildozer.spec
+          set_key() {
+            key="$1"; val="$2"
+            if grep -qE "^${key}[[:space:]]*=" buildozer.spec; then
+              sed -i -E "s|^${key}[[:space:]]*=.*|${key} = ${val}|" buildozer.spec
+            else
+              sed -i "/^\[app\]/a ${key} = ${val}" buildozer.spec
+            fi
+          }
+          set_key android.sdk_path "${ANDROID_HOME}"
+          set_key android.ndk_path "${ANDROID_NDK_HOME}"
+          set_key android.api "${ANDROID_API}"
+          set_key android.minapi 24
+          set_key android.ndk 25b
+          set_key android.ndk_api 24
+          set_key android.archs arm64-v8a
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "ANDROID_HOME=$ANDROID_HOME" \
+            "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" \
+            "BUILDOZER_WARN_ON_ROOT=0" \
+            buildozer -v android debug 2>&1 | tee build.log
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" || true
+
+      - name: Show build log on failure
+        if: failure()
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          tail -n 150 build.log || true
+
+      - name: Collect the APK into bin/
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          mkdir -p bin
+          if ! ls bin/*.apk > /dev/null 2>&1; then
+            find "$GITHUB_WORKSPACE" -name "*.apk" -not -path "*/node_modules/*" -exec cp -v {} bin/ \;
+          fi
+          ls -la bin
+          if ! ls bin/*.apk > /dev/null 2>&1; then
+            echo "Buildozer finished but produced no APK."
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tactical-neural-matrix-apk
+          path: ${{ env.APP_DIR }}/bin/*.apk
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.APP_DIR }}/build.log
+          if-no-files-found: ignore
